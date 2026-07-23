@@ -1,0 +1,13 @@
+# Secrets — ne JAMAIS committer
+.env
+service_account.json
+
+# Données personnelles et fichiers générés
+planning_state.json
+historique_retroactif.csv
+pending_ack.txt
+*.log
+
+# Environnement Python
+venv/
+__pycache__/

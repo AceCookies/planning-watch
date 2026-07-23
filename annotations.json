@@ -1,0 +1,20 @@
+{
+  "H+": {
+    "emoji": "⏰",
+    "label": "Heure(s) supplémentaire(s)",
+    "short": "Heures supp",
+    "urgent": false
+  },
+  "DEC_48h": {
+    "emoji": "🚨",
+    "label": "Changement de planning sous 48h",
+    "short": "Changé <48h",
+    "urgent": true
+  },
+  "PARIFS": {
+    "emoji": "🚗",
+    "label": "Affecté(e) au PARIF",
+    "short": "PARIF",
+    "urgent": false
+  }
+}
