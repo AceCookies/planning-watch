@@ -46,6 +46,12 @@ SITE_PASSWORD = os.getenv("SITE_PASSWORD", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 # Webhook du channel dédié aux documents (peut être le même)
 DISCORD_DOCS_WEBHOOK_URL = os.getenv("DISCORD_DOCS_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
+# Ping Discord : ton ID utilisateur (mode dev > clic droit sur ton pseudo >
+# Copier l'identifiant), ou "@here" / "@everyone"
+DISCORD_PING = os.getenv("DISCORD_PING", "").strip()
+# true = ping seulement pour les changements urgents (DEC_48h, annotation
+# retirée, jour passé) ; false = ping à chaque changement
+DISCORD_PING_URGENT_ONLY = os.getenv("DISCORD_PING_URGENT_ONLY", "false").lower() == "true"
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -75,6 +81,20 @@ NOTIFY_NEW_WEEKS = os.getenv("NOTIFY_NEW_WEEKS", "true").lower() == "true"
 AUTO_ACKNOWLEDGE = os.getenv("AUTO_ACKNOWLEDGE", "false").lower() == "true"
 
 ACK_PATTERNS = re.compile(r"prendre\s+en\s+compte|pris\s+connaissance|j'accepte|valider", re.I)
+
+# --- Notes / documents internes (page "mes-notes") ---
+NOTES_ENABLED = os.getenv("NOTES_ENABLED", "true").lower() == "true"
+NOTES_LIST_URL = BASE_URL + "/personnel/v2/ajax/afficherNotes.php"
+NOTES_MARKLU_URL = BASE_URL + "/personnel/v2/ajax/noteLue.php"
+NOTES_DOC_URL = os.getenv(
+    "NOTES_DOC_URL",
+    "https://surete-nantes.hubsafe.eu/module/site_personnels/espace_entreprise/document/",
+)
+NOTES_REFERER = BASE_URL + "/mes-informations-a-voir/mes-notes"
+# Valider automatiquement "Pris en compte" (true) ou seulement notifier (false)
+NOTES_AUTO_MARKLU = os.getenv("NOTES_AUTO_MARKLU", "false").lower() == "true"
+# Fichier mémoire des notes déjà traitées (anti-doublon)
+NOTES_SEEN_FILE = SCRIPT_DIR / "notes_seen.json"
 DOC_LINK_PATTERNS = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|png|jpe?g)(\?|$)|t[ée]l[ée]charg|download|/document", re.I)
 UNAVAILABLE_MARKER = "planning non disponible"
 DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
@@ -329,6 +349,8 @@ def handle_interstitial(session: requests.Session, interstitial: dict) -> None:
                 "Le planning est inaccessible tant que tu ne l'as pas pris en compte.\n"
                 f"➡️ Connecte-toi ici pour le valider : {BASE_URL}"
             )
+        if DISCORD_PING and not AUTO_ACKNOWLEDGE:
+            msg = f"{ping_prefix()}\n{msg}"
         notify_discord(msg)
         notify_email("📄 Document sur le site du personnel", msg)
         PENDING_ACK_FILE.write_text(title, encoding="utf-8")
@@ -341,6 +363,176 @@ def handle_interstitial(session: requests.Session, interstitial: dict) -> None:
         ack.raise_for_status()
     else:
         raise InterstitialBlocked(title)
+
+
+# ---------------------------------------------------------------------------
+# Notes / documents internes
+# ---------------------------------------------------------------------------
+
+# Extrait chaque note : open_file('<fichier>', '<idNote>', <lu>, <flag>, '<verif>')
+NOTE_RE = re.compile(
+    r"open_file\('([^']+)',\s*'([^']+)',\s*(\d+),\s*(\d+),\s*'([^']*)'\)"
+)
+# Titre associé : le <h1> qui suit dans la même ligne de tableau
+NOTE_TITLE_RE = re.compile(r"<h1>(.*?)</h1>", re.I | re.S)
+
+
+def fetch_notes(session: requests.Session) -> list[dict]:
+    """Récupère la liste des notes non lues via afficherNotes.php."""
+    r = session.post(
+        NOTES_LIST_URL,
+        data={"nonLu": ""},
+        headers={"X-Requested-With": "XMLHttpRequest", "Referer": NOTES_REFERER},
+        timeout=30,
+    )
+    r.raise_for_status()
+    html = r.text
+    if "pas de notes" in html.lower():
+        return []
+
+    notes = []
+    titles = NOTE_TITLE_RE.findall(html)
+    for idx, m in enumerate(NOTE_RE.finditer(html)):
+        fichier, id_note, lu, flag, verif = m.groups()
+        titre = normalize(re.sub("<[^>]+>", "", titles[idx])) if idx < len(titles) else fichier
+        notes.append({
+            "fichier": fichier, "id": id_note, "lu": int(lu),
+            "flag": flag, "verif": verif, "titre": titre,
+        })
+    return notes
+
+
+def download_note_pdf(session: requests.Session, fichier: str) -> bytes | None:
+    try:
+        r = session.get(NOTES_DOC_URL + fichier, timeout=60)
+        r.raise_for_status()
+        if r.content[:4] == b"%PDF":
+            log.info("PDF %s téléchargé (%d Ko).", fichier, len(r.content) // 1024)
+            return r.content
+        log.warning("Le fichier %s ne semble pas être un PDF (status %s, %d octets).",
+                    fichier, r.status_code, len(r.content))
+    except Exception as e:
+        log.error("Téléchargement PDF %s échoué : %s", fichier, e)
+    return None
+
+
+def mark_note_read(session: requests.Session, id_note: str) -> bool:
+    """Envoie le 'Pris en compte' (noteLue.php)."""
+    try:
+        r = session.post(
+            NOTES_MARKLU_URL,
+            data={"idNote": id_note},
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": NOTES_REFERER},
+            timeout=30,
+        )
+        r.raise_for_status()
+        log.info("Note %s marquée comme lue.", id_note)
+        return True
+    except Exception as e:
+        log.error("Validation note %s échouée : %s", id_note, e)
+        return False
+
+
+def send_note(session: requests.Session, note: dict) -> None:
+    """Envoie une note sur Discord (+ email) avec le PDF en pièce jointe."""
+    pdf = download_note_pdf(session, note["fichier"])
+    ping = ping_prefix() if DISCORD_PING else ""
+    entete = f"{ping}\n" if ping else ""
+
+    statut_valid = ""
+    if NOTES_AUTO_MARKLU:
+        ok = mark_note_read(session, note["id"])
+        statut_valid = "\n✅ Validé automatiquement (« Pris en compte »)." if ok else \
+                       "\n⚠️ Validation automatique échouée, à faire manuellement."
+    else:
+        statut_valid = f"\n➡️ À valider sur le site : {NOTES_REFERER}"
+
+    msg = f"{entete}📄 **Nouveau document : {note['titre']}**{statut_valid}"
+
+    # Discord : PDF en pièce jointe si dispo, sinon message seul
+    if pdf and DISCORD_DOCS_WEBHOOK_URL and len(pdf) <= MAX_DISCORD_FILE_SIZE:
+        try:
+            payload = {"content": msg}
+            if ping:
+                payload["allowed_mentions"] = (
+                    {"parse": ["everyone"]} if not ping.startswith("<@")
+                    else {"users": [ping.strip("<@!>")]}
+                )
+            requests.post(
+                DISCORD_DOCS_WEBHOOK_URL,
+                data={"payload_json": json.dumps(payload)},
+                files={"file": (note["fichier"], pdf, "application/pdf")},
+                timeout=60,
+            ).raise_for_status()
+            log.info("Note '%s' envoyée sur Discord (PDF joint).", note["titre"])
+        except Exception as e:
+            log.error("Envoi Discord note échoué : %s", e)
+            notify_discord(msg, webhook=DISCORD_DOCS_WEBHOOK_URL)
+    else:
+        notify_discord(msg + ("\n(PDF trop volumineux ou indisponible)" if not pdf else ""),
+                       webhook=DISCORD_DOCS_WEBHOOK_URL)
+
+    # Email avec PDF joint
+    send_note_email(note, pdf, statut_valid)
+
+
+def send_note_email(note: dict, pdf: bytes | None, statut: str) -> None:
+    if not (SMTP_USER and SMTP_PASSWORD and EMAIL_TO):
+        return
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.application import MIMEApplication
+    try:
+        msg = MIMEMultipart()
+        msg["Subject"] = f"📄 Nouveau document : {note['titre']}"
+        msg["From"] = SMTP_USER
+        msg["To"] = EMAIL_TO
+        corps = f"Nouveau document sur le site du personnel : {note['titre']}{statut}"
+        msg.attach(MIMEText(corps, "plain", "utf-8"))
+        if pdf:
+            part = MIMEApplication(pdf, _subtype="pdf")
+            part.add_header("Content-Disposition", "attachment", filename=note["fichier"])
+            msg.attach(part)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        log.info("Note '%s' envoyée par email.", note["titre"])
+    except Exception as e:
+        log.error("Envoi email note échoué : %s", e)
+
+
+def check_documents(session: requests.Session) -> None:
+    """Détecte les nouvelles notes non lues, les envoie et les valide."""
+    if not NOTES_ENABLED:
+        return
+    try:
+        notes = fetch_notes(session)
+    except Exception as e:
+        log.error("Récupération des notes échouée : %s", e)
+        return
+
+    if not notes:
+        log.info("Aucune note non lue.")
+        return
+
+    seen = set()
+    if NOTES_SEEN_FILE.exists():
+        try:
+            seen = set(json.loads(NOTES_SEEN_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            seen = set()
+
+    nouvelles = [n for n in notes if n["id"] not in seen]
+    log.info("%d note(s) non lue(s), %d nouvelle(s).", len(notes), len(nouvelles))
+
+    for note in nouvelles:
+        log.info("Traitement note : %s", note["titre"])
+        send_note(session, note)
+        seen.add(note["id"])
+
+    NOTES_SEEN_FILE.write_text(
+        json.dumps(sorted(seen), ensure_ascii=False), encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +595,39 @@ def parse_planning(html: str) -> dict:
 
 
 def normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    # Uniformise les heures : 4:00-23:00 -> 04:00-23:00
+    value = re.sub(r"\b(\d):(\d{2})", r"0\1:\2", value)
+    return value
+
+
+JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+           "août", "septembre", "octobre", "novembre", "décembre"]
+
+
+def date_lisible(date_str: str) -> str:
+    """05/08/2026 -> 'mercredi 5 août'."""
+    d = datetime.strptime(date_str, "%d/%m/%Y").date()
+    return f"{JOURS_FR[d.weekday()]} {d.day} {MOIS_FR[d.month - 1]}"
+
+
+def jours_restants(date_str: str) -> int:
+    return (datetime.strptime(date_str, "%d/%m/%Y").date() - datetime.now().date()).days
+
+
+def echeance(date_str: str) -> str:
+    """Texte du type 'dans 3 jours' / 'demain' / 'il y a 5 jours'."""
+    n = jours_restants(date_str)
+    if n == 0:
+        return "aujourd'hui"
+    if n == 1:
+        return "demain"
+    if n == -1:
+        return "hier"
+    if n > 1:
+        return f"dans {n} jours"
+    return f"il y a {abs(n)} jours"
 
 
 def is_unavailable(value: str) -> bool:
@@ -494,6 +718,145 @@ def format_change(date: str, before: str | None, after: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Mise en forme des notifications
+# ---------------------------------------------------------------------------
+
+COLOR_URGENT = 0xE74C3C   # rouge   : DEC_48h / annotation retirée
+COLOR_RETRO = 0xE67E22    # orange  : changement sur un jour passé
+COLOR_CHANGE = 0x3498DB   # bleu    : modification classique
+COLOR_NEW = 0x2ECC71      # vert    : nouveau planning publié
+COLOR_REMOVED = 0x95A5A6  # gris    : planning retiré
+
+
+def describe_change(date: str, before: str | None, after: str) -> dict:
+    """Analyse un changement et retourne tous les éléments d'affichage."""
+    retro = jours_restants(date) < 0
+    removed_codes = []
+    if before is not None and not is_unavailable(after):
+        removed_codes = sorted(
+            {c for c, _ in find_annotations(before)} - {c for c, _ in find_annotations(after)}
+        )
+
+    was_off = before is not None and (before.strip().upper() == "OFF" or is_unavailable(before))
+    now_off = after.strip().upper() == "OFF" or is_unavailable(after)
+
+    if before is None or was_off:
+        kind, titre, color = "nouveau", "Nouveau créneau", COLOR_NEW
+        if was_off and before.strip().upper() == "OFF":
+            titre = "Journée travaillée ajoutée"
+    elif now_off:
+        kind, titre, color = "retire", "Créneau retiré", COLOR_REMOVED
+        if after.strip().upper() == "OFF":
+            titre = "Journée libérée"
+    elif retro:
+        kind, titre, color = "retro", "Modifié après coup", COLOR_RETRO
+    else:
+        kind, titre, color = "modifie", "Horaire modifié", COLOR_CHANGE
+
+    if removed_codes and strip_annotations(before) == strip_annotations(after):
+        titre = "Annotation retirée"
+    if is_urgent(after) or removed_codes:
+        color = COLOR_URGENT
+
+    return {
+        "date": date, "before": before, "after": after, "kind": kind,
+        "titre": titre, "color": color, "retro": retro,
+        "removed_codes": removed_codes,
+    }
+
+
+def change_lines(info: dict) -> list[str]:
+    """Corps du message pour un changement, en lignes lisibles."""
+    before, after, kind = info["before"], info["after"], info["after"]
+    lines = []
+
+    if info["kind"] == "nouveau":
+        lines.append(f"**{strip_annotations(info['after'])}**")
+    elif info["kind"] == "retire":
+        lines.append(f"~~{strip_annotations(before)}~~ → *plus de créneau prévu*")
+    else:
+        h_before, h_after = strip_annotations(before), strip_annotations(info["after"])
+        if h_before == h_after:
+            lines.append(f"**{h_after}** *(horaire inchangé)*")
+        else:
+            lines.append(f"~~{h_before}~~ → **{h_after}**")
+        d1 = shift_duration_minutes(before)
+        d2 = shift_duration_minutes(info["after"])
+        if d1 is not None and d2 is not None and d1 != d2:
+            delta = d2 - d1
+            mot = "de plus" if delta > 0 else "de moins"
+            lines.append(f"⏱️ {format_minutes_delta(delta).lstrip('+-')} {mot} qu'annoncé")
+
+    for code, ann in find_annotations(info["after"]):
+        lines.append(f"{ann.get('emoji', '•')} {ann['label']}")
+
+    for code in info["removed_codes"]:
+        ann = ANNOTATIONS.get(code, {"label": code})
+        lines.append(f"❗ **Retiré : {ann['label']}**")
+
+    return lines
+
+
+def strip_annotations(value: str | None) -> str:
+    """Retire les codes du texte pour n'afficher que l'horaire."""
+    if not value:
+        return ""
+    out = value
+    for code in ANNOTATIONS:
+        out = re.sub(re.escape(code), "", out, flags=re.I)
+    return normalize(out).strip("=> ·-").strip() or value
+
+
+def build_embeds(changes: list[tuple]) -> list[dict]:
+    """Construit les embeds Discord : une carte par jour modifié."""
+    infos = [describe_change(*c) for c in changes]
+    urgents = sum(1 for i in infos if i["color"] == COLOR_URGENT)
+    retros = sum(1 for i in infos if i["retro"])
+
+    embeds = []
+    # Carte de synthèse
+    resume = f"**{len(infos)}** changement(s) sur ton planning"
+    extras = []
+    if urgents:
+        extras.append(f"🚨 {urgents} à vérifier")
+    if retros:
+        extras.append(f"🕓 {retros} sur des jours passés")
+    if extras:
+        resume += "\n" + " · ".join(extras)
+
+    embeds.append({
+        "title": "📋 Ton planning a changé",
+        "description": resume,
+        "color": COLOR_URGENT if urgents else COLOR_CHANGE,
+        "footer": {"text": f"Vérifié le {datetime.now().strftime('%d/%m à %Hh%M')}"},
+    })
+
+    for info in infos[:9]:  # 9 + la synthèse = 10 max par message
+        embeds.append({
+            "title": f"{date_lisible(info['date'])}",
+            "description": "\n".join(change_lines(info)),
+            "color": info["color"],
+            "footer": {"text": f"{info['titre']} · {echeance(info['date'])}"},
+        })
+    return embeds
+
+
+def build_email_body(changes: list[tuple]) -> str:
+    """Version texte lisible pour l'email."""
+    infos = [describe_change(*c) for c in changes]
+    parts = [f"{len(infos)} changement(s) detecte(s) sur ton planning.", ""]
+    for info in infos:
+        parts.append(f"--- {date_lisible(info['date'])} {info['date']} ({echeance(info['date'])})")
+        parts.append(f"    {info['titre']}")
+        for line in change_lines(info):
+            clean = line.replace("**", "").replace("~~", "").replace("*", "")
+            parts.append(f"    {clean}")
+        parts.append("")
+    parts.append(f"Verifie le {datetime.now().strftime('%d/%m/%Y a %Hh%M')}")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------
 
@@ -508,6 +871,47 @@ def notify_discord(message: str, webhook: str | None = None) -> None:
             r = requests.post(url, json={"content": chunk}, timeout=30)
             r.raise_for_status()
         log.info("Notification Discord envoyée.")
+    except Exception as e:
+        log.error("Échec notification Discord : %s", e)
+
+
+def ping_prefix() -> str:
+    """Construit la mention Discord à partir de DISCORD_PING."""
+    p = DISCORD_PING
+    if not p:
+        return ""
+    if p in ("@here", "@everyone"):
+        return p
+    if p.startswith("<@") or p.startswith("@"):
+        return p if p.startswith("<@") else f"<@{p.lstrip('@')}>"
+    if p.isdigit():  # ID utilisateur brut
+        return f"<@{p}>"
+    return p
+
+
+def notify_discord_embed(embeds: list[dict], webhook: str | None = None,
+                         ping: bool = False) -> None:
+    """Envoie des embeds Discord (max 10 par message), avec ping optionnel."""
+    url = webhook or DISCORD_WEBHOOK_URL
+    if not url:
+        return
+    try:
+        for i in range(0, len(embeds), 10):
+            payload = {"embeds": embeds[i : i + 10]}
+            if ping and i == 0:  # ping uniquement sur le premier message
+                mention = ping_prefix()
+                if mention:
+                    payload["content"] = mention
+                    # Autorise explicitement la mention (sinon Discord peut la muter)
+                    if mention.startswith("<@"):
+                        payload["allowed_mentions"] = {
+                            "users": [mention.strip("<@!>")]
+                        }
+                    else:
+                        payload["allowed_mentions"] = {"parse": ["everyone"]}
+            r = requests.post(url, json=payload, timeout=30)
+            r.raise_for_status()
+        log.info("Notification Discord (embed) envoyée.")
     except Exception as e:
         log.error("Échec notification Discord : %s", e)
 
@@ -702,6 +1106,7 @@ def main() -> int:
 
     try:
         login(session)
+        check_documents(session)
         html = fetch_planning_html(session)
         new_planning = parse_planning(html)
     except InterstitialBlocked:
@@ -721,11 +1126,12 @@ def main() -> int:
         changes = compare(old_planning, new_planning)
         changed_dates = [c[0] for c in changes]
         if changes:
-            lines = [format_change(*c) for c in changes]
-            body = f"🔔 Changement(s) détecté(s) sur ton planning ({len(lines)}) :\n\n" + "\n".join(lines)
-            log.info(body)
-            notify_discord(body)
-            notify_email("⚠️ Changement de planning détecté", body)
+            log.info("%d changement(s) : %s", len(changes), [c[0] for c in changes])
+            urgents = any(describe_change(*c)["color"] == COLOR_URGENT for c in changes)
+            do_ping = bool(DISCORD_PING) and (urgents or not DISCORD_PING_URGENT_ONLY)
+            notify_discord_embed(build_embeds(changes), ping=do_ping)
+            sujet = "🚨 Planning modifié — à vérifier" if urgents else "📋 Ton planning a changé"
+            notify_email(sujet, build_email_body(changes))
             log_retro_changes(changes)
         else:
             log.info("Aucun changement.")
