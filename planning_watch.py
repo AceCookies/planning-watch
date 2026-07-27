@@ -95,6 +95,13 @@ NOTES_REFERER = BASE_URL + "/mes-informations-a-voir/mes-notes"
 NOTES_AUTO_MARKLU = os.getenv("NOTES_AUTO_MARKLU", "false").lower() == "true"
 # Fichier mémoire des notes déjà traitées (anti-doublon)
 NOTES_SEEN_FILE = SCRIPT_DIR / "notes_seen.json"
+
+# --- Message de statut (auto-mis à jour) ---
+DISCORD_STATUS_WEBHOOK_URL = os.getenv("DISCORD_STATUS_WEBHOOK_URL", "")
+STATUS_MSG_ID_FILE = SCRIPT_DIR / "status_message_id.txt"
+STATUS_STATS_FILE = SCRIPT_DIR / "status_stats.json"
+# Intervalle attendu entre deux passages, en minutes (pour l'affichage seulement)
+STATUS_INTERVAL_MIN = int(os.getenv("STATUS_INTERVAL_MIN", "0"))
 DOC_LINK_PATTERNS = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|png|jpe?g)(\?|$)|t[ée]l[ée]charg|download|/document", re.I)
 UNAVAILABLE_MARKER = "planning non disponible"
 DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
@@ -501,19 +508,19 @@ def send_note_email(note: dict, pdf: bytes | None, statut: str) -> None:
         log.error("Envoi email note échoué : %s", e)
 
 
-def check_documents(session: requests.Session) -> None:
+def check_documents(session: requests.Session) -> int:
     """Détecte les nouvelles notes non lues, les envoie et les valide."""
     if not NOTES_ENABLED:
-        return
+        return 0
     try:
         notes = fetch_notes(session)
     except Exception as e:
         log.error("Récupération des notes échouée : %s", e)
-        return
+        return 0
 
     if not notes:
         log.info("Aucune note non lue.")
-        return
+        return 0
 
     seen = set()
     if NOTES_SEEN_FILE.exists():
@@ -533,6 +540,7 @@ def check_documents(session: requests.Session) -> None:
     NOTES_SEEN_FILE.write_text(
         json.dumps(sorted(seen), ensure_ascii=False), encoding="utf-8"
     )
+    return len(nouvelles)
 
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1062,92 @@ def gcal_sync(dates: list[str], planning: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Message de statut (auto-mis à jour)
+# ---------------------------------------------------------------------------
+
+
+def update_status(stats: dict) -> None:
+    """Crée ou met à jour le message de statut Discord (édition en place)."""
+    if not DISCORD_STATUS_WEBHOOK_URL:
+        return
+
+    ok = stats.get("ok", True)
+    now = datetime.now()
+
+    fields = [
+        {"name": "🔌 État",
+         "value": "🟢 Opérationnel" if ok else "🔴 Erreur au dernier passage",
+         "inline": True},
+        {"name": "🕐 Dernière vérification",
+         "value": now.strftime("%d/%m/%Y à %Hh%M"), "inline": True},
+    ]
+    if STATUS_INTERVAL_MIN > 0:
+        prochaine = now + timedelta(minutes=STATUS_INTERVAL_MIN)
+        fields.append({"name": "⏭️ Prochaine (théorique)",
+                       "value": prochaine.strftime("%Hh%M"), "inline": True})
+
+    fields.append({
+        "name": "📅 Planning suivi",
+        "value": (f"{stats.get('jours', 0)} jours\n"
+                  f"dont {stats.get('publies', 0)} publiés"),
+        "inline": True,
+    })
+    derniere = stats.get("derniere_modif")
+    fields.append({
+        "name": "🔄 Dernière modif détectée",
+        "value": derniere or "aucune depuis le démarrage",
+        "inline": True,
+    })
+    fields.append({
+        "name": "📄 Documents traités",
+        "value": f"{stats.get('notes_total', 0)} au total",
+        "inline": True,
+    })
+    if stats.get("erreur"):
+        fields.append({"name": "⚠️ Détail erreur",
+                       "value": str(stats["erreur"])[:200], "inline": False})
+
+    embed = {
+        "title": "🛡️ Surveillance du planning — Statut",
+        "description": ("Surveillance automatique du site du personnel.\n"
+                        "Ce message se met à jour à chaque vérification."),
+        "color": 0x2ECC71 if ok else 0xE74C3C,
+        "fields": fields,
+        "footer": {"text": "planning_watch • mis à jour"},
+        "timestamp": now.astimezone().isoformat(),
+    }
+
+    # Édition du message existant, sinon création
+    msg_id = None
+    if STATUS_MSG_ID_FILE.exists():
+        msg_id = STATUS_MSG_ID_FILE.read_text(encoding="utf-8").strip() or None
+
+    try:
+        if msg_id:
+            r = requests.patch(
+                f"{DISCORD_STATUS_WEBHOOK_URL}/messages/{msg_id}",
+                json={"embeds": [embed]}, timeout=30,
+            )
+            if r.status_code == 404:  # message supprimé -> on en recrée un
+                msg_id = None
+            else:
+                r.raise_for_status()
+                return
+        if not msg_id:
+            r = requests.post(
+                DISCORD_STATUS_WEBHOOK_URL + "?wait=true",
+                json={"embeds": [embed]}, timeout=30,
+            )
+            r.raise_for_status()
+            new_id = r.json().get("id")
+            if new_id:
+                STATUS_MSG_ID_FILE.write_text(str(new_id), encoding="utf-8")
+                log.info("Message de statut créé (id %s).", new_id)
+    except Exception as e:
+        log.error("Mise à jour du statut échouée : %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Historique des changements rétroactifs (vérification fiche de paie)
 # ---------------------------------------------------------------------------
 
@@ -1096,6 +1190,15 @@ def log_retro_changes(changes: list[tuple[str, str | None, str | None]]) -> None
 # ---------------------------------------------------------------------------
 
 
+def load_status_stats() -> dict:
+    if STATUS_STATS_FILE.exists():
+        try:
+            return json.loads(STATUS_STATS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
 def main() -> int:
     if not SITE_LOGIN or not SITE_PASSWORD:
         log.error("SITE_LOGIN / SITE_PASSWORD manquants dans .env")
@@ -1104,18 +1207,34 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    stats = load_status_stats()  # conserve l'historique entre les passages
+
     try:
         login(session)
-        check_documents(session)
+        notes_traitees = check_documents(session)
+        stats["notes_total"] = stats.get("notes_total", 0) + (notes_traitees or 0)
         html = fetch_planning_html(session)
         new_planning = parse_planning(html)
     except InterstitialBlocked:
-        return 0  # notification déjà envoyée, on réessaiera au prochain cron
+        # Bloqué par un document : on considère le passage réussi
+        stats["ok"] = True
+        stats["erreur"] = None
+        save_and_push_status(stats)
+        return 0
     except Exception as e:
         log.error("Erreur : %s", e)
+        stats["ok"] = False
+        stats["erreur"] = str(e)
+        save_and_push_status(stats)
         return 1
 
     log.info("%d jours extraits du planning.", len(new_planning))
+
+    stats["jours"] = len(new_planning)
+    stats["publies"] = sum(
+        1 for v in new_planning.values()
+        if not is_unavailable(v) and v.strip().upper() != "OFF"
+    )
 
     first_run = not STATE_FILE.exists()
     if first_run:
@@ -1133,6 +1252,9 @@ def main() -> int:
             sujet = "🚨 Planning modifié — à vérifier" if urgents else "📋 Ton planning a changé"
             notify_email(sujet, build_email_body(changes))
             log_retro_changes(changes)
+            stats["derniere_modif"] = (
+                f"{len(changes)} le {datetime.now().strftime('%d/%m à %Hh%M')}"
+            )
         else:
             log.info("Aucun changement.")
 
@@ -1142,7 +1264,22 @@ def main() -> int:
     STATE_FILE.write_text(
         json.dumps(new_planning, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    stats["ok"] = True
+    stats["erreur"] = None
+    save_and_push_status(stats)
     return 0
+
+
+def save_and_push_status(stats: dict) -> None:
+    """Sauvegarde les stats et met à jour le message Discord."""
+    try:
+        STATUS_STATS_FILE.write_text(
+            json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        log.error("Sauvegarde stats échouée : %s", e)
+    update_status(stats)
 
 
 if __name__ == "__main__":
