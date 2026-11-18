@@ -1,13 +1,33 @@
-# Secrets — ne JAMAIS committer
+# === SECRETS - NE JAMAIS COMMITER ===
 .env
-service_account.json
+.env.*
+oauth_client.json
+token.json
+*.token
 
-# Données personnelles et fichiers générés
+# === DONNÉES RH PRIVÉES (nom, matricule, salaires) ===
+emargement.json
+paie_mensuelle.json
+verif_paie.json
+notes_historique.json
+notes_seen.json
 planning_state.json
-historique_retroactif.csv
-pending_ack.txt
-*.log
+annotations.json
+status_stats.json
+status_message_id.txt
+releves/
+releves*.zip
+bulletins/
+*.pdf
 
-# Environnement Python
-venv/
+# === LOGS & CACHE ===
+*.log
+cron.log
 __pycache__/
+*.pyc
+venv/
+dashboard.html
+
+# === DIVERS ===
+_archive/
+*.b64

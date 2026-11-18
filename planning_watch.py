@@ -36,6 +36,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
 
 BASE_URL = os.getenv("SITE_URL", "https://sitedupersonnel-surete-nantes.hubsafe.eu").rstrip("/")
+# URL de secours : le site migre vers planete-online.fr (note de service 12/11/2026).
+# Si BASE_URL ne répond plus, le script bascule automatiquement sur SITE_URL_FALLBACK.
+SITE_URL_FALLBACK = os.getenv(
+    "SITE_URL_FALLBACK", "https://web-samsic-safesquare-nantes.planete-online.fr"
+).rstrip("/")
 LOGIN_PAGE = os.getenv("LOGIN_PAGE", "/")
 PLANNING_PAGE = os.getenv("PLANNING_PAGE", "")
 
@@ -78,12 +83,35 @@ GCAL_OAUTH_TOKEN_FILE = os.getenv(
 GCAL_TIMEZONE = os.getenv("GCAL_TIMEZONE", "Europe/Paris")
 GCAL_EVENT_PREFIX = os.getenv("GCAL_EVENT_PREFIX", "🛡️ Travail")
 GCAL_SYNC_CP = os.getenv("GCAL_SYNC_CP", "true").lower() == "true"
+# Titre fixe, lieu et rappels des événements agenda
+GCAL_EVENT_TITLE = os.getenv("GCAL_EVENT_TITLE", "Sûreté Aéroport ( LFRS )")
+GCAL_LOCATION = os.getenv(
+    "GCAL_LOCATION", "Aéroport Nantes Atlantique, 44346 Bouguenais, France"
+)
+# Rappels avant l'événement, en minutes, séparés par des virgules
+GCAL_REMINDERS = os.getenv("GCAL_REMINDERS", "30,60,120")
+# Couleurs Google Agenda (colorId) : 11=rouge(Tomate) 6=orange(Mandarine)
+# 5=jaune(Banane) 3=violet(Raisin) 10=vert(Basilic) 9=bleu(Myrtille)
+GCAL_COLOR_FRET = os.getenv("GCAL_COLOR_FRET", "11")   # rouge (DHL)
+GCAL_COLOR_FOR = os.getenv("GCAL_COLOR_FOR", "3")      # violet (formation)
+GCAL_COLOR_HSUP = os.getenv("GCAL_COLOR_HSUP", "6")    # orange (heure sup)
+
+
+def _gcal_reminders() -> dict:
+    """Construit le bloc de rappels Google à partir de GCAL_REMINDERS."""
+    mins = [int(m.strip()) for m in GCAL_REMINDERS.split(",") if m.strip().isdigit()]
+    if not mins:
+        return {"useDefault": True}
+    return {"useDefault": False,
+            "overrides": [{"method": "popup", "minutes": m} for m in mins]}
 
 STATE_FILE = SCRIPT_DIR / "planning_state.json"
 PENDING_ACK_FILE = SCRIPT_DIR / "pending_ack.txt"
 LOG_FILE = SCRIPT_DIR / "planning_watch.log"
 # Historique des changements rétroactifs (pour vérifier la fiche de paie)
 RETRO_CSV = SCRIPT_DIR / "historique_retroactif.csv"
+# Historique complet de TOUS les changements (alimente le dashboard)
+HIST_COMPLET_CSV = SCRIPT_DIR / "historique_complet.csv"
 
 NOTIFY_NEW_WEEKS = os.getenv("NOTIFY_NEW_WEEKS", "true").lower() == "true"
 
@@ -105,6 +133,8 @@ NOTES_REFERER = BASE_URL + "/mes-informations-a-voir/mes-notes"
 NOTES_AUTO_MARKLU = os.getenv("NOTES_AUTO_MARKLU", "false").lower() == "true"
 # Fichier mémoire des notes déjà traitées (anti-doublon)
 NOTES_SEEN_FILE = SCRIPT_DIR / "notes_seen.json"
+# Historique des notes (titre + date) pour le dashboard
+NOTES_HIST_FILE = SCRIPT_DIR / "notes_historique.json"
 
 # --- Message de statut (auto-mis à jour) ---
 DISCORD_STATUS_WEBHOOK_URL = os.getenv("DISCORD_STATUS_WEBHOOK_URL", "")
@@ -188,6 +218,48 @@ class InterstitialBlocked(Exception):
 # ---------------------------------------------------------------------------
 # Connexion
 # ---------------------------------------------------------------------------
+
+
+def _url_repond(session: requests.Session, base: str) -> bool:
+    """Vérifie qu'une URL de base répond et sert bien une page de login."""
+    try:
+        r = session.get(urljoin(base + "/", LOGIN_PAGE.lstrip("/")), timeout=20)
+        if r.status_code != 200:
+            return False
+        txt = r.text.lower()
+        return "mot de passe" in txt or "password" in txt or "login" in txt
+    except Exception:
+        return False
+
+
+def detecter_url_active(session: requests.Session) -> None:
+    """
+    Teste l'URL principale, bascule sur le fallback si besoin.
+    Met à jour BASE_URL et les URLs dérivées. Prévient sur Discord à la bascule.
+    """
+    global BASE_URL, NOTES_LIST_URL, NOTES_MARKLU_URL, NOTES_REFERER
+
+    if _url_repond(session, BASE_URL):
+        return  # l'URL principale marche, rien à faire
+
+    # L'URL principale ne répond pas : on tente le fallback
+    if SITE_URL_FALLBACK and SITE_URL_FALLBACK != BASE_URL and _url_repond(session, SITE_URL_FALLBACK):
+        ancienne, nouvelle = BASE_URL, SITE_URL_FALLBACK
+        BASE_URL = nouvelle
+        NOTES_LIST_URL = BASE_URL + "/personnel/v2/ajax/afficherNotes.php"
+        NOTES_MARKLU_URL = BASE_URL + "/personnel/v2/ajax/noteLue.php"
+        NOTES_REFERER = BASE_URL + "/mes-informations-a-voir/mes-notes"
+        log.warning("BASCULE URL : %s ne répond plus → %s", ancienne, nouvelle)
+        msg = (
+            f"{ping_prefix() + chr(10) if DISCORD_PING else ''}"
+            f"🔀 **Changement d'URL détecté !**\n"
+            f"L'ancienne adresse ne répond plus, bascule automatique vers :\n{nouvelle}\n\n"
+            f"⚠️ Pense à mettre à jour `SITE_URL` dans le `.env` pour pérenniser "
+            f"(et vérifie `NOTES_DOC_URL` pour les PDF)."
+        )
+        notify_discord(msg)
+        notify_email("🔀 Changement d'URL du site du personnel", msg)
+    # Si aucune ne répond, on laisse login() lever l'erreur habituelle
 
 
 def login(session: requests.Session) -> None:
@@ -518,6 +590,24 @@ def send_note_email(note: dict, pdf: bytes | None, statut: str) -> None:
         log.error("Envoi email note échoué : %s", e)
 
 
+def _enregistrer_note_historique(note: dict) -> None:
+    """Ajoute une note (titre + date) à notes_historique.json pour le dashboard."""
+    try:
+        hist = []
+        if NOTES_HIST_FILE.exists():
+            hist = json.loads(NOTES_HIST_FILE.read_text(encoding="utf-8"))
+        hist.append({
+            "titre": note.get("titre", "Document"),
+            "date": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "fichier": note.get("fichier", ""),
+        })
+        NOTES_HIST_FILE.write_text(
+            json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        log.error("Enregistrement note historique échoué : %s", e)
+
+
 def check_documents(session: requests.Session) -> int:
     """Détecte les nouvelles notes non lues, les envoie et les valide."""
     if not NOTES_ENABLED:
@@ -546,6 +636,7 @@ def check_documents(session: requests.Session) -> int:
         log.info("Traitement note : %s", note["titre"])
         send_note(session, note)
         seen.add(note["id"])
+        _enregistrer_note_historique(note)
 
     NOTES_SEEN_FILE.write_text(
         json.dumps(sorted(seen), ensure_ascii=False), encoding="utf-8"
@@ -877,7 +968,7 @@ def build_embeds(changes: list[tuple], titre: str = "📋 Ton planning a changé
 
 
 def build_email_body(changes: list[tuple]) -> str:
-    """Version texte lisible pour l'email."""
+    """Version texte lisible pour l'email (fallback des clients sans HTML)."""
     infos = [describe_change(*c) for c in changes]
     parts = [f"{len(infos)} changement(s) detecte(s) sur ton planning.", ""]
     for info in infos:
@@ -889,6 +980,105 @@ def build_email_body(changes: list[tuple]) -> str:
         parts.append("")
     parts.append(f"Verifie le {datetime.now().strftime('%d/%m/%Y a %Hh%M')}")
     return "\n".join(parts)
+
+
+def _hx(color_int: int) -> str:
+    """0xRRGGBB -> '#rrggbb'."""
+    return f"#{color_int:06x}"
+
+
+def build_email_html(changes: list[tuple], titre: str = "Ton planning a changé") -> str:
+    """Version HTML embellie de l'email : bandeau + cartes colorées par jour."""
+    import html as _html
+
+    infos = [describe_change(*c) for c in changes]
+    urgents = sum(1 for i in infos if i["color"] == COLOR_URGENT)
+    retros = sum(1 for i in infos if i["retro"])
+
+    # Sous-titre récap
+    extras = []
+    if urgents:
+        extras.append(f"🚨 {urgents} à vérifier")
+    if retros:
+        extras.append(f"🕓 {retros} sur des jours passés")
+    sous_titre = f"{len(infos)} changement(s) sur ton planning"
+    if extras:
+        sous_titre += " · " + " · ".join(extras)
+
+    # Couleur du bandeau selon la gravité
+    header_color = _hx(COLOR_URGENT if urgents else COLOR_CHANGE)
+
+    cartes = []
+    for info in infos:
+        bord = _hx(info["color"])
+        # Corps de la carte
+        corps_lignes = []
+        for line in change_lines(info):
+            # markdown léger -> HTML
+            t = _html.escape(line)
+            t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+            t = re.sub(r"~~(.+?)~~", r'<span style="text-decoration:line-through;color:#999;">\1</span>', t)
+            t = re.sub(r"\*(.+?)\*", r"<em>\1</em>", t)
+            t = t.replace("→", '<span style="color:#888;">→</span>')
+            corps_lignes.append(f'<div style="margin:4px 0;font-size:15px;color:#2c3e50;">{t}</div>')
+        corps = "".join(corps_lignes)
+
+        cartes.append(f"""
+        <tr><td style="padding:0 20px 14px 20px;">
+          <table width="100%" cellpadding="0" cellspacing="0"
+                 style="background:#ffffff;border-radius:12px;border-left:5px solid {bord};
+                        box-shadow:0 1px 3px rgba(0,0,0,0.08);overflow:hidden;">
+            <tr><td style="padding:16px 18px;">
+              <div style="font-size:17px;font-weight:700;color:#1a1a2e;text-transform:capitalize;">
+                {_html.escape(date_lisible(info['date']))}
+              </div>
+              <div style="font-size:12px;color:#8a8a9a;margin:2px 0 10px 0;">
+                {_html.escape(info['titre'])} · {_html.escape(echeance(info['date']))}
+              </div>
+              {corps}
+            </td></tr>
+          </table>
+        </td></tr>""")
+
+    maintenant = datetime.now().strftime("%d/%m/%Y à %Hh%M")
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f2f5;padding:24px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- Bandeau -->
+        <tr><td style="padding:0 20px 18px 20px;">
+          <table width="100%" cellpadding="0" cellspacing="0"
+                 style="background:{header_color};border-radius:14px;">
+            <tr><td style="padding:22px 24px;text-align:center;">
+              <div style="font-size:30px;line-height:1;">🛡️</div>
+              <div style="font-size:21px;font-weight:800;color:#ffffff;margin-top:8px;">
+                {_html.escape(titre)}
+              </div>
+              <div style="font-size:14px;color:rgba(255,255,255,0.9);margin-top:6px;">
+                {_html.escape(sous_titre)}
+              </div>
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <!-- Cartes -->
+        {''.join(cartes)}
+
+        <!-- Pied -->
+        <tr><td style="padding:8px 20px 0 20px;text-align:center;">
+          <div style="font-size:12px;color:#a0a0b0;">
+            Vérifié le {maintenant} · 🤖 planning_watch
+          </div>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -951,11 +1141,17 @@ def notify_discord_embed(embeds: list[dict], webhook: str | None = None,
         log.error("Échec notification Discord : %s", e)
 
 
-def notify_email(subject: str, body: str) -> None:
+def notify_email(subject: str, body: str, html: str | None = None) -> None:
     if not (SMTP_USER and SMTP_PASSWORD and EMAIL_TO):
         return
     try:
-        msg = MIMEText(body, "plain", "utf-8")
+        if html:
+            from email.mime.multipart import MIMEMultipart
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            msg.attach(MIMEText(html, "html", "utf-8"))
+        else:
+            msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
         msg["From"] = SMTP_USER
         msg["To"] = EMAIL_TO
@@ -1024,9 +1220,16 @@ def _gcal_oauth_flow():
 
 
 def gcal_event_body(date_str: str, value: str) -> dict | None:
-    """Construit l'événement Google Agenda pour une journée, ou None (OFF, etc.)."""
+    """Construit l'événement Google Agenda pour une journée, ou None (OFF/ABS/etc.)."""
     day = datetime.strptime(date_str, "%d/%m/%Y").date()
     props = {"private": {"pw_date": date_str.replace("/", "-")}}
+    val_up = value.strip().upper()
+
+    rappels = _gcal_reminders()
+
+    # ABS = absence -> pas d'événement (la ligne est retirée de l'agenda)
+    if val_up.startswith("ABS"):
+        return None
 
     m = TIME_RANGE_RE.search(value)
     if m:
@@ -1036,36 +1239,59 @@ def gcal_event_body(date_str: str, value: str) -> dict | None:
         if end <= start:
             end += timedelta(days=1)  # vacation qui passe minuit
 
-        # Titre lisible : annotations connues traduites, reste tel quel
+        # Détection des conditions spéciales
+        has_for = bool(re.search(r"\bFOR\b", value, re.I))        # formation
+        has_hsup = bool(re.search(r"H\+", value))                 # heure sup
+        # FRET : un créneau lun-ven (weekday 0-4) qui finit à 22h30
+        is_fret = (day.weekday() <= 4 and h2 == 22 and m2 == 30)
+
+        # Titre
+        titre = f"{GCAL_EVENT_TITLE} - FRET" if is_fret else GCAL_EVENT_TITLE
+
+        # Couleur (priorité : FRET > FOR > H+ > couleur par défaut de l'agenda)
+        color = None
+        if is_fret:
+            color = GCAL_COLOR_FRET
+        elif has_for:
+            color = GCAL_COLOR_FOR
+        elif has_hsup:
+            color = GCAL_COLOR_HSUP
+
+        # Description
         found = find_annotations(value)
-        leftover = normalize(TIME_RANGE_RE.sub("", value))
-        for code, _ in found:
-            leftover = normalize(re.sub(re.escape(code), "", leftover, flags=re.I))
-        leftover = leftover.strip("=> ·-").strip()
+        horaire = f"{h1:02d}:{m1:02d} - {h2:02d}:{m2:02d}"
+        lignes = [f"🕐 Vacation : {horaire}"]
+        if is_fret:
+            lignes.append("📦 FRET")
+        if found:
+            lignes.append("")
+            for _, info in found:
+                lignes.append(f"{info.get('emoji', '•')} {info['label']}")
+        lignes.append("")
+        lignes.append("— sync automatique planning_watch")
 
-        parts = [
-            f"{info.get('emoji', '')} {info.get('short', info['label'])}".strip()
-            for _, info in found
-        ]
-        if leftover:
-            parts.append(leftover)
-        summary = GCAL_EVENT_PREFIX + (f" · {' · '.join(parts)}" if parts else "")
-
-        return {
-            "summary": summary,
-            "description": f"Vacation : {explain(value)}\n(sync automatique planning_watch)",
+        body = {
+            "summary": titre,
+            "location": GCAL_LOCATION,
+            "description": "\n".join(lignes),
             "start": {"dateTime": start.isoformat(), "timeZone": GCAL_TIMEZONE},
             "end": {"dateTime": end.isoformat(), "timeZone": GCAL_TIMEZONE},
             "extendedProperties": props,
+            "reminders": rappels,
         }
+        if color:
+            body["colorId"] = color
+        return body
 
-    if value.upper().startswith("CP") and GCAL_SYNC_CP:
+    if val_up.startswith("CP") and GCAL_SYNC_CP:
         return {
-            "summary": "🏖️ Congé (CP)",
-            "description": f"{value}\n(sync automatique planning_watch)",
+            "summary": f"{GCAL_EVENT_TITLE} — Congé (CP)",
+            "location": GCAL_LOCATION,
+            "description": f"{value}\n\n— sync automatique planning_watch",
             "start": {"date": day.isoformat()},
             "end": {"date": (day + timedelta(days=1)).isoformat()},
             "extendedProperties": props,
+            "reminders": rappels,
         }
 
     return None  # OFF, planning non disponible, etc. -> pas d'événement
@@ -1257,6 +1483,53 @@ def log_retro_changes(changes: list[tuple[str, str | None, str | None]]) -> None
     log.info("%d changement(s) rétroactif(s) consigné(s) dans %s", len(retro), RETRO_CSV.name)
 
 
+def log_all_changes(changes: list[tuple[str, str | None, str | None]]) -> None:
+    """Consigne TOUS les changements dans historique_complet.csv (dashboard)."""
+    import csv
+    if not changes:
+        return
+    fields = ["detecte_le", "jour_concerne", "avant", "apres",
+              "delta_minutes", "type", "codes"]
+    new_file = not HIST_COMPLET_CSV.exists()
+    maintenant = datetime.now().strftime("%d/%m/%Y %H:%M")
+    # Écriture atomique : fichier temp puis remplacement (résiste au disque plein)
+    tmp = HIST_COMPLET_CSV.with_suffix(".csv.tmp")
+    existing = HIST_COMPLET_CSV.read_text(encoding="utf-8") if not new_file else ""
+    lines = []
+    for d, before, after in changes:
+        info = describe_change(d, before, after)
+        d1, d2 = shift_duration_minutes(before), shift_duration_minutes(after)
+        delta = (d2 - d1) if (d1 is not None and d2 is not None) else ""
+        codes = " ".join(c for c, _ in find_annotations(after or ""))
+        lines.append([maintenant, d, before or "", after or "",
+                      delta, info["kind"], codes])
+    try:
+        with tmp.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter=";")
+            if new_file:
+                w.writerow(fields)
+                f.write("")
+            else:
+                f.write(existing if existing.endswith("\n") or not existing else existing + "\n")
+            for row in lines:
+                w.writerow(row)
+        tmp.replace(HIST_COMPLET_CSV)
+        log.info("%d changement(s) consigné(s) dans %s", len(lines), HIST_COMPLET_CSV.name)
+    except Exception as e:
+        log.error("Écriture historique complet échouée : %s", e)
+        tmp.unlink(missing_ok=True)
+
+
+def refresh_dashboard() -> None:
+    """Régénère le dashboard HTML (si le module dashboard.py est présent)."""
+    try:
+        import dashboard
+        dashboard.generate()
+        log.info("Dashboard régénéré.")
+    except Exception as e:
+        log.error("Régénération dashboard échouée : %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1282,6 +1555,7 @@ def main() -> int:
     stats = load_status_stats()  # conserve l'historique entre les passages
 
     try:
+        detecter_url_active(session)  # bascule auto si l'URL a changé
         login(session)
         notes_traitees = check_documents(session)
         stats["notes_total"] = stats.get("notes_total", 0) + (notes_traitees or 0)
@@ -1335,8 +1609,14 @@ def main() -> int:
 
             urgents_all = any(describe_change(*c)["color"] == COLOR_URGENT for c in changes)
             sujet = "🚨 Planning modifié — à vérifier" if urgents_all else "📋 Ton planning a changé"
-            notify_email(sujet, build_email_body(changes))
+            titre_mail = "Planning modifié" if urgents_all else "Ton planning a changé"
+            notify_email(
+                sujet,
+                build_email_body(changes),
+                html=build_email_html(changes, titre=titre_mail),
+            )
             log_retro_changes(changes)
+            log_all_changes(changes)  # historique complet (dashboard)
             stats["derniere_modif"] = (
                 f"{len(changes)} le {datetime.now().strftime('%d/%m à %Hh%M')}"
             )
@@ -1349,6 +1629,9 @@ def main() -> int:
     STATE_FILE.write_text(
         json.dumps(new_planning, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # Régénère le dashboard à chaque passage (reflète toujours l'état actuel)
+    refresh_dashboard()
 
     stats["ok"] = True
     stats["erreur"] = None

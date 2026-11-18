@@ -1,0 +1,14 @@
+[Unit]
+Description=Dashboard Planning (serveur web protégé)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/planning_watch
+ExecStart=/root/planning_watch/venv/bin/python /root/planning_watch/serve_dashboard.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
